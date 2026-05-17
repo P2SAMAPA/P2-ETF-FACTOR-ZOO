@@ -26,11 +26,13 @@ def main():
             all_results[universe_name] = {"top_etfs": []}
             continue
 
+        # Get macro data
         macro = df[config.MACRO_COLS].copy() if all(c in df.columns for c in config.MACRO_COLS) else pd.DataFrame()
         if macro.empty:
             print("  No macro data; using zeros")
             macro = pd.DataFrame(0, index=returns.index, columns=config.MACRO_COLS)
 
+        # Build factor zoo for the entire period
         factor_df, factor_names = build_factor_zoo(returns, macro, config.LAG_DAYS, config.TECHNICAL_WINDOWS)
         common_idx = returns.index.intersection(factor_df.index)
         factor_df = factor_df.loc[common_idx]
@@ -38,6 +40,7 @@ def main():
 
         best_per_etf = {}
         window_results = {}
+        all_predictions = []  # to detect if all zero
 
         for win in config.WINDOWS:
             if len(returns) < win + 20:
@@ -72,16 +75,15 @@ def main():
                 if np.isnan(pred) or np.isinf(pred):
                     pred = 0.0
                 etf_pred[etf] = pred
+                all_predictions.append(pred)
             window_results[win] = etf_pred
             for etf, pred in etf_pred.items():
                 if etf not in best_per_etf or pred > best_per_etf[etf][0]:
                     best_per_etf[etf] = (pred, win)
 
-        # If all best predictions are zero (or very small), fallback to historical mean
-        all_zeros = all(abs(pred) < 1e-6 for pred, _ in best_per_etf.values())
-        if all_zeros:
-            print("  All predictions zero, falling back to historical mean return")
-            best_per_etf = {}
+        # If all predictions are zero (or near zero), fallback to historical mean
+        if best_per_etf and max(abs(p) for p in [v[0] for v in best_per_etf.values()]) < 1e-6:
+            print("  All model predictions zero, using historical mean return as fallback")
             for etf in tickers:
                 if etf in returns.columns:
                     mean_ret = returns[etf].iloc[-252:].mean()
@@ -99,7 +101,7 @@ def main():
         for ticker, (pred, win) in sorted_etfs[:config.TOP_N]:
             top_etfs.append({"ticker": ticker, "pred_return": float(pred), "best_window": win})
             full_scores[ticker] = {"score": float(pred), "best_window": win}
-        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]} (predictions: {[e['pred_return'] for e in top_etfs]})")
+        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]}")
         all_results[universe_name] = {
             "top_etfs": top_etfs,
             "full_scores": full_scores,
@@ -114,7 +116,7 @@ def main():
 
     import push_results
     push_results.push_daily_result(local_path)
-    print("\n=== Factor Zoo Compression Engine (multi‑window) complete ===")
+    print("\n=== Factor Zoo Compression Engine complete ===")
 
 if __name__ == "__main__":
     main()
