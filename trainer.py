@@ -21,7 +21,7 @@ def main():
     for universe_name, tickers in config.UNIVERSES.items():
         print(f"\n=== Universe: {universe_name} (Factor Zoo Compression) ===")
         returns = data_manager.prepare_returns_matrix(df, tickers)
-        if returns.empty or len(returns) < config.TRAIN_WINDOW + 50:
+        if returns.empty or len(returns) < min(config.WINDOWS) + 50:
             print("  Insufficient data")
             all_results[universe_name] = {"top_etfs": []}
             continue
@@ -32,83 +32,86 @@ def main():
             print("  No macro data; using zeros")
             macro = pd.DataFrame(0, index=returns.index, columns=config.MACRO_COLS)
 
-        # Build factor zoo for the entire period
+        # Build factor zoo for the entire period (we will slice per window)
         factor_df, factor_names = build_factor_zoo(returns, macro, config.LAG_DAYS, config.TECHNICAL_WINDOWS)
-        # Align with returns index
         common_idx = returns.index.intersection(factor_df.index)
         factor_df = factor_df.loc[common_idx]
         returns = returns.loc[common_idx]
 
-        # Prepare training data (rolling window)
-        predictions = {}
-        for i in range(config.TRAIN_WINDOW, len(returns)-1):
-            X = factor_df.iloc[i-config.TRAIN_WINDOW:i].values
-            y = returns.iloc[i-config.TRAIN_WINDOW:i].values
-            # Flatten X: rows are days, columns are factors. But we need to predict next day for EACH ETF? We'll model each ETF separately.
-            # Simpler: treat each ETF's return as a separate target, but that would require many models.
-            # Alternative: use the factors to predict the cross‑sectional return of each ETF individually.
-            # For each ETF, we need its own training data. That's a lot of models.
-            # To keep it practical, we'll build a single model that predicts the return of a specific ETF? Not correct.
-            # The standard approach: factors are asset‑agnostic (macro, market‑wide), so we can train one model per ETF.
-            # We'll loop over ETFs and train per‑ETF models.
-            # That's what we will do: For each ETF, build a dataset of (factor vectors, next‑day return of that ETF).
-            # Then compress and predict.
+        # For each ETF, store best prediction and the window that achieved it
+        best_per_etf = {}   # ticker -> (best_pred, best_window)
+        window_results = {} # win -> dict of predictions
 
-        # We restructure: For each ETF, we have a time series of its own returns and the same factor matrix.
-        # We'll train per‑ETF models.
-
-        etf_predictions = {}
-        for etf in tickers:
-            if etf not in returns.columns:
+        for win in config.WINDOWS:
+            if len(returns) < win + 20:
+                print(f"  Skipping window {win}d (insufficient data)")
                 continue
-            # Build X (factors) and y (ETF returns) over time
-            X_all = factor_df.values
-            y_all = returns[etf].values
-            # Align indices
-            valid = ~np.isnan(y_all)
-            X_all = X_all[valid]
-            y_all = y_all[valid]
-            if len(X_all) < config.TRAIN_WINDOW + 20:
+            print(f"  Processing window {win}d...")
+            etf_pred = {}
+            for etf in tickers:
+                if etf not in returns.columns:
+                    continue
+                # Build training data for this window
+                # Use the last `win` days of factor and returns
+                X_all = factor_df.iloc[-win:].values
+                y_all = returns[etf].iloc[-win:].values
+                # Remove any NaN rows
+                valid = ~np.isnan(y_all)
+                X_train = X_all[valid]
+                y_train = y_all[valid]
+                if len(X_train) < 20:
+                    continue
+                # Standardise features
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X_train)
+                # Train model on this window
+                if config.COMPRESSION_METHOD == "double_lasso":
+                    coef, selected = double_lasso_compress(X_scaled, y_train,
+                                                           alpha1=config.FIRST_LASSO_ALPHA,
+                                                           alpha2=config.SECOND_LASSO_ALPHA)
+                    # Predict using the most recent factor vector (the last day of factor_df)
+                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                    X_last_scaled = scaler.transform(X_last)
+                    pred = np.dot(X_last_scaled, coef)[0]
+                else:
+                    # PPCA
+                    predict_func, _, _, _ = ppca_compress(X_scaled, y_train, n_components=config.PPCA_COMPONENTS)
+                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                    X_last_scaled = scaler.transform(X_last)
+                    pred = predict_func(X_last_scaled)[0]
+                # Handle NaN or inf
+                if np.isnan(pred) or np.isinf(pred):
+                    pred = 0.0
+                etf_pred[etf] = pred
+            window_results[win] = etf_pred
+            # Update best per ETF
+            for etf, pred in etf_pred.items():
+                if etf not in best_per_etf or pred > best_per_etf[etf][0]:
+                    best_per_etf[etf] = (pred, win)
+
+        if not best_per_etf:
+            # Fallback: use historical mean return
+            print("  No model predictions, falling back to historical mean return")
+            for etf in tickers:
+                if etf in returns.columns:
+                    mean_ret = returns[etf].iloc[-252:].mean()
+                    best_per_etf[etf] = (mean_ret, 0)   # window 0 indicates fallback
+            if not best_per_etf:
+                all_results[universe_name] = {"top_etfs": []}
                 continue
-            # Rolling walk‑forward prediction: train on last TRAIN_WINDOW days, predict next day
-            # For simplicity, train on the entire history? But we need a single prediction for tomorrow.
-            # We'll take the last TRAIN_WINDOW days as training, then predict the next day.
-            X_train = X_all[-config.TRAIN_WINDOW:]
-            y_train = y_all[-config.TRAIN_WINDOW:]
-            # Standardise features
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            if config.COMPRESSION_METHOD == "double_lasso":
-                coef, selected = double_lasso_compress(X_train_scaled, y_train,
-                                                       alpha1=config.FIRST_LASSO_ALPHA,
-                                                       alpha2=config.SECOND_LASSO_ALPHA)
-                # Predict on the most recent factor vector (the day after the training window)
-                # The factors for the next day (today) are the last row of factor_df
-                X_last = factor_df.iloc[-1].values.reshape(1, -1)
-                X_last_scaled = scaler.transform(X_last)
-                pred = np.dot(X_last_scaled, coef)[0]
-            else:  # ppca
-                predict_func, _, _, _ = ppca_compress(X_train_scaled, y_train, n_components=config.PPCA_COMPONENTS)
-                X_last = factor_df.iloc[-1].values.reshape(1, -1)
-                X_last_scaled = scaler.transform(X_last)
-                pred = predict_func(X_last_scaled)[0]
-            etf_predictions[etf] = pred
 
-        if not etf_predictions:
-            print("  No predictions")
-            all_results[universe_name] = {"top_etfs": []}
-            continue
-
-        sorted_etfs = sorted(etf_predictions.items(), key=lambda x: x[1], reverse=True)
+        # Sort by best prediction descending
+        sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
         top_etfs = []
         full_scores = {}
-        for ticker, pred in sorted_etfs[:config.TOP_N]:
-            top_etfs.append({"ticker": ticker, "pred_return": float(pred)})
-            full_scores[ticker] = float(pred)
-        print(f"  Top 3 ETFs by predicted return: {[e['ticker'] for e in top_etfs]}")
+        for ticker, (pred, win) in sorted_etfs[:config.TOP_N]:
+            top_etfs.append({"ticker": ticker, "pred_return": float(pred), "best_window": win})
+            full_scores[ticker] = {"score": float(pred), "best_window": win}
+        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]}")
         all_results[universe_name] = {
             "top_etfs": top_etfs,
             "full_scores": full_scores,
+            "window_results": window_results,
             "run_date": today
         }
 
@@ -119,7 +122,7 @@ def main():
 
     import push_results
     push_results.push_daily_result(local_path)
-    print("\n=== Factor Zoo Compression Engine complete ===")
+    print("\n=== Factor Zoo Compression Engine (multi‑window) complete ===")
 
 if __name__ == "__main__":
     main()
