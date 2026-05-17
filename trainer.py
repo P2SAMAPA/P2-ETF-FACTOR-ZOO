@@ -26,15 +26,11 @@ def main():
             all_results[universe_name] = {"top_etfs": []}
             continue
 
-        # Get macro data
-        available_macro = [c for c in config.MACRO_COLS if c in df.columns]
-        if not available_macro:
-            print("  No macro columns found; using dummy zero macro")
-            macro = pd.DataFrame(0, index=returns.index, columns=["dummy"])
-        else:
-            macro = df[available_macro].copy()
+        macro = df[config.MACRO_COLS].copy() if all(c in df.columns for c in config.MACRO_COLS) else pd.DataFrame()
+        if macro.empty:
+            print("  No macro data; using zeros")
+            macro = pd.DataFrame(0, index=returns.index, columns=config.MACRO_COLS)
 
-        # Build factor zoo
         factor_df, factor_names = build_factor_zoo(returns, macro, config.LAG_DAYS, config.TECHNICAL_WINDOWS)
         common_idx = returns.index.intersection(factor_df.index)
         factor_df = factor_df.loc[common_idx]
@@ -52,7 +48,6 @@ def main():
             for etf in tickers:
                 if etf not in returns.columns:
                     continue
-                # Use last `win` days for training
                 X_all = factor_df.iloc[-win:].values
                 y_all = returns[etf].iloc[-win:].values
                 valid = ~np.isnan(y_all)
@@ -62,42 +57,41 @@ def main():
                     continue
                 scaler = StandardScaler()
                 X_scaled = scaler.fit_transform(X_train)
-                try:
-                    if config.COMPRESSION_METHOD == "double_lasso":
-                        coef, selected = double_lasso_compress(X_scaled, y_train,
-                                                               alpha1=config.FIRST_LASSO_ALPHA,
-                                                               alpha2=config.SECOND_LASSO_ALPHA)
-                        X_last = factor_df.iloc[-1].values.reshape(1, -1)
-                        X_last_scaled = scaler.transform(X_last)
-                        pred = np.dot(X_last_scaled, coef)[0]
-                    else:
-                        predict_func, _, _, _ = ppca_compress(X_scaled, y_train, n_components=config.PPCA_COMPONENTS)
-                        X_last = factor_df.iloc[-1].values.reshape(1, -1)
-                        X_last_scaled = scaler.transform(X_last)
-                        pred = predict_func(X_last_scaled)[0]
-                except Exception as e:
-                    print(f"    Model failed for {etf}: {e}")
-                    pred = np.nan
+                if config.COMPRESSION_METHOD == "double_lasso":
+                    coef, selected = double_lasso_compress(X_scaled, y_train,
+                                                           alpha1=config.FIRST_LASSO_ALPHA,
+                                                           alpha2=config.SECOND_LASSO_ALPHA)
+                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                    X_last_scaled = scaler.transform(X_last)
+                    pred = np.dot(X_last_scaled, coef)[0]
+                else:
+                    predict_func, _, _, _ = ppca_compress(X_scaled, y_train, n_components=config.PPCA_COMPONENTS)
+                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                    X_last_scaled = scaler.transform(X_last)
+                    pred = predict_func(X_last_scaled)[0]
                 if np.isnan(pred) or np.isinf(pred):
-                    # Fallback: use recent mean return
-                    pred = returns[etf].iloc[-21:].mean()
-                    if np.isnan(pred):
-                        pred = 0.0001  # tiny positive
+                    pred = 0.0
                 etf_pred[etf] = pred
             window_results[win] = etf_pred
             for etf, pred in etf_pred.items():
                 if etf not in best_per_etf or pred > best_per_etf[etf][0]:
                     best_per_etf[etf] = (pred, win)
 
-        # If no predictions yet (e.g., all windows skipped), use recent mean return for each ETF
-        if not best_per_etf:
-            print("  No window predictions, using recent 63d mean return")
+        # If all best predictions are zero (or very small), fallback to historical mean
+        all_zeros = all(abs(pred) < 1e-6 for pred, _ in best_per_etf.values())
+        if all_zeros:
+            print("  All predictions zero, falling back to historical mean return")
+            best_per_etf = {}
             for etf in tickers:
                 if etf in returns.columns:
-                    mean_ret = returns[etf].iloc[-63:].mean()
-                    if np.isnan(mean_ret):
-                        mean_ret = 0.0001
-                    best_per_etf[etf] = (mean_ret, 0)
+                    mean_ret = returns[etf].iloc[-252:].mean()
+                    if not np.isnan(mean_ret):
+                        best_per_etf[etf] = (mean_ret, 0)
+
+        if not best_per_etf:
+            print("  No valid predictions")
+            all_results[universe_name] = {"top_etfs": []}
+            continue
 
         sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
         top_etfs = []
