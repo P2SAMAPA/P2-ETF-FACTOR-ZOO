@@ -27,20 +27,21 @@ def main():
             continue
 
         # Get macro data
-        macro = df[config.MACRO_COLS].copy() if all(c in df.columns for c in config.MACRO_COLS) else pd.DataFrame()
-        if macro.empty:
-            print("  No macro data; using zeros")
-            macro = pd.DataFrame(0, index=returns.index, columns=config.MACRO_COLS)
+        available_macro = [c for c in config.MACRO_COLS if c in df.columns]
+        if not available_macro:
+            print("  No macro columns found; using dummy zero macro")
+            macro = pd.DataFrame(0, index=returns.index, columns=["dummy"])
+        else:
+            macro = df[available_macro].copy()
 
-        # Build factor zoo for the entire period (we will slice per window)
+        # Build factor zoo
         factor_df, factor_names = build_factor_zoo(returns, macro, config.LAG_DAYS, config.TECHNICAL_WINDOWS)
         common_idx = returns.index.intersection(factor_df.index)
         factor_df = factor_df.loc[common_idx]
         returns = returns.loc[common_idx]
 
-        # For each ETF, store best prediction and the window that achieved it
-        best_per_etf = {}   # ticker -> (best_pred, best_window)
-        window_results = {} # win -> dict of predictions
+        best_per_etf = {}
+        window_results = {}
 
         for win in config.WINDOWS:
             if len(returns) < win + 20:
@@ -51,63 +52,60 @@ def main():
             for etf in tickers:
                 if etf not in returns.columns:
                     continue
-                # Build training data for this window
-                # Use the last `win` days of factor and returns
+                # Use last `win` days for training
                 X_all = factor_df.iloc[-win:].values
                 y_all = returns[etf].iloc[-win:].values
-                # Remove any NaN rows
                 valid = ~np.isnan(y_all)
                 X_train = X_all[valid]
                 y_train = y_all[valid]
                 if len(X_train) < 20:
                     continue
-                # Standardise features
                 scaler = StandardScaler()
                 X_scaled = scaler.fit_transform(X_train)
-                # Train model on this window
-                if config.COMPRESSION_METHOD == "double_lasso":
-                    coef, selected = double_lasso_compress(X_scaled, y_train,
-                                                           alpha1=config.FIRST_LASSO_ALPHA,
-                                                           alpha2=config.SECOND_LASSO_ALPHA)
-                    # Predict using the most recent factor vector (the last day of factor_df)
-                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
-                    X_last_scaled = scaler.transform(X_last)
-                    pred = np.dot(X_last_scaled, coef)[0]
-                else:
-                    # PPCA
-                    predict_func, _, _, _ = ppca_compress(X_scaled, y_train, n_components=config.PPCA_COMPONENTS)
-                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
-                    X_last_scaled = scaler.transform(X_last)
-                    pred = predict_func(X_last_scaled)[0]
-                # Handle NaN or inf
+                try:
+                    if config.COMPRESSION_METHOD == "double_lasso":
+                        coef, selected = double_lasso_compress(X_scaled, y_train,
+                                                               alpha1=config.FIRST_LASSO_ALPHA,
+                                                               alpha2=config.SECOND_LASSO_ALPHA)
+                        X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                        X_last_scaled = scaler.transform(X_last)
+                        pred = np.dot(X_last_scaled, coef)[0]
+                    else:
+                        predict_func, _, _, _ = ppca_compress(X_scaled, y_train, n_components=config.PPCA_COMPONENTS)
+                        X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                        X_last_scaled = scaler.transform(X_last)
+                        pred = predict_func(X_last_scaled)[0]
+                except Exception as e:
+                    print(f"    Model failed for {etf}: {e}")
+                    pred = np.nan
                 if np.isnan(pred) or np.isinf(pred):
-                    pred = 0.0
+                    # Fallback: use recent mean return
+                    pred = returns[etf].iloc[-21:].mean()
+                    if np.isnan(pred):
+                        pred = 0.0001  # tiny positive
                 etf_pred[etf] = pred
             window_results[win] = etf_pred
-            # Update best per ETF
             for etf, pred in etf_pred.items():
                 if etf not in best_per_etf or pred > best_per_etf[etf][0]:
                     best_per_etf[etf] = (pred, win)
 
+        # If no predictions yet (e.g., all windows skipped), use recent mean return for each ETF
         if not best_per_etf:
-            # Fallback: use historical mean return
-            print("  No model predictions, falling back to historical mean return")
+            print("  No window predictions, using recent 63d mean return")
             for etf in tickers:
                 if etf in returns.columns:
-                    mean_ret = returns[etf].iloc[-252:].mean()
-                    best_per_etf[etf] = (mean_ret, 0)   # window 0 indicates fallback
-            if not best_per_etf:
-                all_results[universe_name] = {"top_etfs": []}
-                continue
+                    mean_ret = returns[etf].iloc[-63:].mean()
+                    if np.isnan(mean_ret):
+                        mean_ret = 0.0001
+                    best_per_etf[etf] = (mean_ret, 0)
 
-        # Sort by best prediction descending
         sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
         top_etfs = []
         full_scores = {}
         for ticker, (pred, win) in sorted_etfs[:config.TOP_N]:
             top_etfs.append({"ticker": ticker, "pred_return": float(pred), "best_window": win})
             full_scores[ticker] = {"score": float(pred), "best_window": win}
-        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]}")
+        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]} (predictions: {[e['pred_return'] for e in top_etfs]})")
         all_results[universe_name] = {
             "top_etfs": top_etfs,
             "full_scores": full_scores,
