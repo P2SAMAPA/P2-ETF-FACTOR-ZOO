@@ -21,7 +21,7 @@ def main():
     for universe_name, tickers in config.UNIVERSES.items():
         print(f"\n=== Universe: {universe_name} (Factor Zoo Compression) ===")
         returns = data_manager.prepare_returns_matrix(df, tickers)
-        if returns.empty or len(returns) < min(config.WINDOWS) + 50:
+        if returns.empty or len(returns) < max(config.WINDOWS) + 50:
             print("  Insufficient data")
             all_results[universe_name] = {"top_etfs": []}
             continue
@@ -79,43 +79,27 @@ def main():
                 if etf not in best_per_etf or pred > best_per_etf[etf][0]:
                     best_per_etf[etf] = (pred, win)
 
-        # ---- FALLBACK FOR ZERO PREDICTIONS ----
-        # Compute historical mean return for each ETF (over the last 252 days)
-        hist_means = {}
-        for etf in tickers:
-            if etf in returns.columns:
-                mean_ret = returns[etf].iloc[-252:].mean()
-                if np.isnan(mean_ret):
-                    mean_ret = 0.0
-                hist_means[etf] = mean_ret
-
-        # For any ETF with best prediction <= 0, replace with historical mean (or any small positive)
-        # But to ensure positive signals, we will use the historical mean directly.
-        # However, we want the ranking to be based on something. Let's just use historical mean for all,
-        # but we'll keep the factor predictions if they are better.
-        # Simpler: if the max prediction among all ETFs is <= 0, fall back entirely to historical mean.
-        all_preds = [score for score, _ in best_per_etf.values()]
-        if not all_preds or max(all_preds) <= 0:
-            print("  All factor predictions zero or negative – using historical mean returns (last 252 days) as scores.")
-            best_per_etf = {etf: (hist_means.get(etf, 0.0), 0) for etf in tickers if etf in returns.columns}
-        else:
-            # Also ensure no ETF has a zero prediction – set to historical mean if zero
-            for etf, (pred, win) in list(best_per_etf.items()):
-                if pred <= 0:
-                    best_per_etf[etf] = (hist_means.get(etf, 0.0), 0)
+        # Fallback for zero predictions (e.g., FI universe)
+        all_preds = [score for score, _ in best_per_etf.values()] if best_per_etf else []
+        if best_per_etf and all(abs(p) < 1e-6 for p in all_preds):
+            print("  All predictions zero – falling back to historical mean return (last 252 days)")
+            for etf in tickers:
+                if etf in returns.columns:
+                    mean_ret = returns[etf].iloc[-252:].mean()
+                    if not np.isnan(mean_ret):
+                        best_per_etf[etf] = (mean_ret, 0)
 
         if not best_per_etf:
             print("  No valid predictions")
             all_results[universe_name] = {"top_etfs": []}
             continue
 
+        # Store full scores for all ETFs
+        full_scores = {ticker: {"score": score, "best_window": win} for ticker, (score, win) in best_per_etf.items()}
         sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
-        top_etfs = []
-        full_scores = {}
-        for ticker, (pred, win) in sorted_etfs[:config.TOP_N]:
-            top_etfs.append({"ticker": ticker, "pred_return": float(pred), "best_window": win})
-            full_scores[ticker] = {"score": float(pred), "best_window": win}
-        print(f"  Top 3 ETFs with predictions: {[(e['ticker'], e['pred_return']) for e in top_etfs]}")
+        top_etfs = [{"ticker": ticker, "pred_return": float(score), "best_window": win} for ticker, (score, win) in sorted_etfs[:config.TOP_N]]
+
+        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]}")
         all_results[universe_name] = {
             "top_etfs": top_etfs,
             "full_scores": full_scores,
