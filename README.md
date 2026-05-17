@@ -1,47 +1,18 @@
-# P2-ETF-FACTOR-ZOO
+# Factor Zoo Compression Engine
 
-## Description
+Addresses the "factor zoo" problem by compressing hundreds of candidate factors (lagged returns, macro, volatility, RSI, cross‑sectional moments) into a minimal non‑redundant set using Double Lasso (Belloni et al.) or Probabilistic PCA. Then predicts next‑day ETF returns.
 
-Welcome to the P2-ETF-FACTOR-ZOO repository! This project explores and analyzes various factors in ETF (Exchange-Traded Fund) investment strategies.
+- **Factors:** >200 per universe
+- **Compression:** Double Lasso (default) or PPCA
+- **Training:** Rolling 252‑day window
+- **Output:** top 3 ETFs per universe by predicted return
 
-## Features
+Runs daily on GitHub Actions.
 
-- Factor analysis and research
-- ETF performance tracking
-- Data-driven insights for investment decisions
+## Local execution
 
-## Getting Started
-
-### Prerequisites
-
-- Python 3.x or higher
-- Required dependencies (see `requirements.txt` if available)
-
-### Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/P2SAMAPA/P2-ETF-FACTOR-ZOO.git
-   cd P2-ETF-FACTOR-ZOO
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Usage
-
-[Add usage instructions here]
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Contact
-
-For more information, visit the [GitHub repository](https://github.com/P2SAMAPA/P2-ETF-FACTOR-ZOO).
+```bash
+pip install -r requirements.txt
+export HF_TOKEN=<your_token>
+python trainer.py
+streamlit run streamlit_app.py
