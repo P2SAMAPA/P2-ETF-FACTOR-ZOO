@@ -1,56 +1,120 @@
 import pandas as pd
 import numpy as np
+from pathlib import Path
+import json
+from datetime import datetime
+import config
+import data_manager
+from factor_zoo import build_factor_zoo
+from compression import double_lasso_compress, ppca_compress
+from sklearn.preprocessing import StandardScaler
 
-def compute_rsi(series, window=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(window).mean()
-    avg_loss = loss.rolling(window).mean()
-    rs = avg_gain / (avg_loss + 1e-8)
-    rsi = 100 - 100 / (1 + rs)
-    return rsi
+def main():
+    if not config.HF_TOKEN:
+        print("HF_TOKEN not set")
+        return
 
-def build_factor_zoo(returns_df, macro_df, lag_days=[1,5,21], tech_windows=[5,10,20,50]):
-    """
-    Build a DataFrame of candidate factors (columns) from ETF returns and macro.
-    Returns a factor matrix (days x factors) and list of factor names.
-    """
-    factors = []
-    factor_names = []
-    # 1. Lagged returns of each ETF as factors
-    for lag in lag_days:
-        lagged = returns_df.shift(lag).fillna(0)
-        for col in lagged.columns:
-            factors.append(lagged[col])
-            factor_names.append(f"{col}_lag{lag}")
-    # 2. Macro factors (levels)
-    for col in macro_df.columns:
-        factors.append(macro_df[col])
-        factor_names.append(f"macro_{col}")
-    # 3. Rolling volatility (annualised) for each ETF
-    for window in tech_windows:
-        vol = returns_df.rolling(window).std() * np.sqrt(252)
-        for col in vol.columns:
-            factors.append(vol[col])
-            factor_names.append(f"{col}_vol{window}")
-    # 4. RSI for each ETF (window=14)
-    for col in returns_df.columns:
-        rsi = compute_rsi(returns_df[col], window=14)
-        factors.append(rsi)
-        factor_names.append(f"{col}_rsi14")
-    # 5. Cross-sectional factors: median return, dispersion
-    # Add cross-sectional mean return
-    cs_mean = returns_df.mean(axis=1)
-    factors.append(cs_mean)
-    factor_names.append("cs_mean_return")
-    # Add cross-sectional standard deviation
-    cs_std = returns_df.std(axis=1)
-    factors.append(cs_std)
-    factor_names.append("cs_std_return")
-    # Combine into DataFrame
-    factor_df = pd.concat(factors, axis=1)
-    factor_df.columns = factor_names
-    # Fill any remaining NaN with 0
-    factor_df = factor_df.fillna(0)
-    return factor_df, factor_names
+    df = data_manager.load_master_data()
+    all_results = {}
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    for universe_name, tickers in config.UNIVERSES.items():
+        print(f"\n=== Universe: {universe_name} (Factor Zoo Compression) ===")
+        returns = data_manager.prepare_returns_matrix(df, tickers)
+        if returns.empty or len(returns) < max(config.WINDOWS) + 50:
+            print("  Insufficient data")
+            all_results[universe_name] = {"top_etfs": []}
+            continue
+
+        # Get macro data
+        macro = df[config.MACRO_COLS].copy() if all(c in df.columns for c in config.MACRO_COLS) else pd.DataFrame()
+        if macro.empty:
+            print("  No macro data; using zeros")
+            macro = pd.DataFrame(0, index=returns.index, columns=config.MACRO_COLS)
+
+        # Build factor zoo for the entire period
+        factor_df, factor_names = build_factor_zoo(returns, macro, config.LAG_DAYS, config.TECHNICAL_WINDOWS)
+        common_idx = returns.index.intersection(factor_df.index)
+        factor_df = factor_df.loc[common_idx]
+        returns = returns.loc[common_idx]
+
+        best_per_etf = {}
+        window_results = {}
+
+        for win in config.WINDOWS:
+            if len(returns) < win + 20:
+                print(f"  Skipping window {win}d (insufficient data)")
+                continue
+            print(f"  Processing window {win}d...")
+            etf_pred = {}
+            for etf in tickers:
+                if etf not in returns.columns:
+                    continue
+                X_all = factor_df.iloc[-win:].values
+                y_all = returns[etf].iloc[-win:].values
+                valid = ~np.isnan(y_all)
+                X_train = X_all[valid]
+                y_train = y_all[valid]
+                if len(X_train) < 20:
+                    continue
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X_train)
+                if config.COMPRESSION_METHOD == "double_lasso":
+                    coef, selected = double_lasso_compress(X_scaled, y_train,
+                                                           alpha1=config.FIRST_LASSO_ALPHA,
+                                                           alpha2=config.SECOND_LASSO_ALPHA)
+                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                    X_last_scaled = scaler.transform(X_last)
+                    pred = np.dot(X_last_scaled, coef)[0]
+                else:
+                    predict_func, _, _, _ = ppca_compress(X_scaled, y_train, n_components=config.PPCA_COMPONENTS)
+                    X_last = factor_df.iloc[-1].values.reshape(1, -1)
+                    X_last_scaled = scaler.transform(X_last)
+                    pred = predict_func(X_last_scaled)[0]
+                if np.isnan(pred) or np.isinf(pred):
+                    pred = 0.0
+                etf_pred[etf] = pred
+            window_results[win] = etf_pred
+            for etf, pred in etf_pred.items():
+                if etf not in best_per_etf or pred > best_per_etf[etf][0]:
+                    best_per_etf[etf] = (pred, win)
+
+        # Fallback for zero predictions (e.g., FI universe)
+        all_preds = [score for score, _ in best_per_etf.values()] if best_per_etf else []
+        if best_per_etf and all(abs(p) < 1e-6 for p in all_preds):
+            print("  All predictions zero – falling back to historical mean return (last 252 days)")
+            for etf in tickers:
+                if etf in returns.columns:
+                    mean_ret = returns[etf].iloc[-252:].mean()
+                    if not np.isnan(mean_ret):
+                        best_per_etf[etf] = (mean_ret, 0)
+
+        if not best_per_etf:
+            print("  No valid predictions")
+            all_results[universe_name] = {"top_etfs": []}
+            continue
+
+        # Store full scores for all ETFs
+        full_scores = {ticker: {"score": score, "best_window": win} for ticker, (score, win) in best_per_etf.items()}
+        sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
+        top_etfs = [{"ticker": ticker, "pred_return": float(score), "best_window": win} for ticker, (score, win) in sorted_etfs[:config.TOP_N]]
+
+        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]}")
+        all_results[universe_name] = {
+            "top_etfs": top_etfs,
+            "full_scores": full_scores,
+            "window_results": window_results,
+            "run_date": today
+        }
+
+    Path("results").mkdir(exist_ok=True)
+    local_path = Path(f"results/factor_zoo_{today}.json")
+    with open(local_path, "w") as f:
+        json.dump({"run_date": today, "universes": all_results}, f, indent=2)
+
+    import push_results
+    push_results.push_daily_result(local_path)
+    print("\n=== Factor Zoo Compression Engine (multi‑window) complete ===")
+
+if __name__ == "__main__":
+    main()
