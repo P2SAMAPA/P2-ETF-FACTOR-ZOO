@@ -17,10 +17,13 @@ UNIVERSES = {
     ]
 }
 
+# Rolling windows for training (days)
+WINDOWS = [252, 504, 1008, 2016]
+
 # Factor construction parameters
-LAG_DAYS = [1, 5, 21]                     # lagged returns as factors
+LAG_DAYS = [1, 5, 21]
 MACRO_COLS = ["VIX", "DXY", "T10Y2Y", "TBILL_3M", "IG_SPREAD", "HY_SPREAD"]
-TECHNICAL_WINDOWS = [5, 10, 20, 50]       # for RSI, volatility, etc.
+TECHNICAL_WINDOWS = [5, 10, 20, 50]
 
 # Compression method: 'double_lasso' or 'ppca'
 COMPRESSION_METHOD = "double_lasso"
@@ -31,8 +34,5 @@ SECOND_LASSO_ALPHA = 0.005
 
 # PPCA parameters
 PPCA_COMPONENTS = 20
-
-# Rolling window for training (days)
-TRAIN_WINDOW = 252
 
 TOP_N = 3
