@@ -79,15 +79,19 @@ def main():
                 if etf not in best_per_etf or pred > best_per_etf[etf][0]:
                     best_per_etf[etf] = (pred, win)
 
-        # Fallback for zero predictions (e.g., FI universe)
-        all_preds = [score for score, _ in best_per_etf.values()] if best_per_etf else []
-        if best_per_etf and all(abs(p) < 1e-6 for p in all_preds):
-            print("  All predictions zero – falling back to historical mean return (last 252 days)")
-            for etf in tickers:
-                if etf in returns.columns:
-                    mean_ret = returns[etf].iloc[-252:].mean()
-                    if not np.isnan(mean_ret):
-                        best_per_etf[etf] = (mean_ret, 0)
+        # ----- FALLBACK: if the best factor‑based prediction is near zero, use historical mean -----
+        if best_per_etf:
+            max_pred = max(score for score, _ in best_per_etf.values())
+            if max_pred <= 1e-6:
+                print("  All factor predictions near zero – falling back to historical mean return (last 252 days)")
+                hist_means = {}
+                for etf in tickers:
+                    if etf in returns.columns:
+                        mean_ret = returns[etf].iloc[-252:].mean()
+                        if np.isnan(mean_ret):
+                            mean_ret = 0.0
+                        hist_means[etf] = mean_ret
+                best_per_etf = {etf: (hist_means.get(etf, 0.0), 0) for etf in tickers if etf in returns.columns}
 
         if not best_per_etf:
             print("  No valid predictions")
@@ -99,7 +103,7 @@ def main():
         sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
         top_etfs = [{"ticker": ticker, "pred_return": float(score), "best_window": win} for ticker, (score, win) in sorted_etfs[:config.TOP_N]]
 
-        print(f"  Top 3 ETFs: {[e['ticker'] for e in top_etfs]}")
+        print(f"  Top 3 ETFs: {[(e['ticker'], e['pred_return']) for e in top_etfs]}")
         all_results[universe_name] = {
             "top_etfs": top_etfs,
             "full_scores": full_scores,
