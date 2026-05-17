@@ -18,7 +18,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">📚 Factor Zoo Compression Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Double Lasso / PPCA | Compresses 200+ factors to minimal non‑redundant set | Next‑day return prediction</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Double Lasso / PPCA | Compresses 200+ factors to minimal non‑redundant set | Next‑day return prediction | Multi‑window (252/504/1008/2016d)</div>', unsafe_allow_html=True)
 
 st.sidebar.markdown("## 📚 Factor Zoo")
 st.sidebar.markdown(f"**Run Date:** `{st.session_state.get('run_date', 'Not loaded')}`")
@@ -71,7 +71,7 @@ if "error" in data:
 st.session_state['run_date'] = data['run_date']
 universes = data["universes"]
 
-st.header("🏆 Top ETFs by Compressed‑Factor Predicted Return")
+st.header("🏆 Top ETFs by Compressed‑Factor Predicted Return (Best Window)")
 
 for universe_name, uni_data in universes.items():
     top_etfs = uni_data.get("top_etfs", [])
@@ -81,18 +81,38 @@ for universe_name, uni_data in universes.items():
     cols = st.columns(3)
     for idx, etf in enumerate(top_etfs):
         with cols[idx]:
+            ticker = etf.get('ticker', '?')
+            pred = etf.get('pred_return', 0.0)
+            best_win = etf.get('best_window', 'N/A')
             st.markdown(f"""
             <div class="etf-card">
-                <div class="etf-ticker">{etf['ticker']}</div>
-                <div class="etf-score">pred return = {etf['pred_return']:.4f}</div>
+                <div class="etf-ticker">{ticker}</div>
+                <div class="etf-score">pred return = {pred:.4f}</div>
+                <div class="etf-score">best window = {best_win}d</div>
             </div>
             """, unsafe_allow_html=True)
-    with st.expander("📋 Full ranking (all ETFs)"):
+    # Show window summary (optional)
+    win_res = uni_data.get("window_results", {})
+    if win_res:
+        with st.expander("📊 Window summary (number of ETFs with predictions)"):
+            win_summary = {win: len(scores) for win, scores in win_res.items()}
+            st.write(win_summary)
+    with st.expander("📋 Full ranking (all ETFs, best window per ETF)"):
         full = uni_data.get("full_scores", {})
         if full:
-            df = pd.DataFrame(list(full.items()), columns=["ETF", "Predicted Return"])
-            df = df.sort_values("Predicted Return", ascending=False)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            # Convert dict to DataFrame safely
+            rows = []
+            for ticker, info in full.items():
+                if isinstance(info, dict):
+                    score = info.get('score', 0.0)
+                    win = info.get('best_window', 'N/A')
+                else:
+                    score = info
+                    win = 'N/A'
+                rows.append({"ETF": ticker, "Best Predicted Return": score, "Best Window": win})
+            df = pd.DataFrame(rows).sort_values("Best Predicted Return", ascending=False)
+            if not df.empty:
+                st.dataframe(df, use_container_width=True, hide_index=True)
     st.divider()
 
-st.caption("The engine constructs a factor zoo (>200 factors) from lagged returns, macro variables, volatility, RSI, and cross‑sectional moments. Double Lasso (or PPCA) compresses the factor set to the minimal non‑redundant predictors, then a linear model predicts next‑day returns. Higher predicted return → stronger long signal.")
+st.caption("The engine compresses a factor zoo (>200 factors) using Double Lasso or PPCA across multiple rolling windows (252, 504, 1008, 2016 days). For each ETF, we select the window that gives the highest predicted return. Higher predicted return → stronger long signal.")
