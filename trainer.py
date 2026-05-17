@@ -79,15 +79,30 @@ def main():
                 if etf not in best_per_etf or pred > best_per_etf[etf][0]:
                     best_per_etf[etf] = (pred, win)
 
-        # If all best_per_etf predictions are zero (or near zero), fallback to historical mean return
+        # ---- FALLBACK FOR ZERO PREDICTIONS ----
+        # Compute historical mean return for each ETF (over the last 252 days)
+        hist_means = {}
+        for etf in tickers:
+            if etf in returns.columns:
+                mean_ret = returns[etf].iloc[-252:].mean()
+                if np.isnan(mean_ret):
+                    mean_ret = 0.0
+                hist_means[etf] = mean_ret
+
+        # For any ETF with best prediction <= 0, replace with historical mean (or any small positive)
+        # But to ensure positive signals, we will use the historical mean directly.
+        # However, we want the ranking to be based on something. Let's just use historical mean for all,
+        # but we'll keep the factor predictions if they are better.
+        # Simpler: if the max prediction among all ETFs is <= 0, fall back entirely to historical mean.
         all_preds = [score for score, _ in best_per_etf.values()]
-        if all(abs(p) < 1e-6 for p in all_preds):
-            print("  All predictions zero – falling back to historical mean return (last 252 days)")
-            for etf in tickers:
-                if etf in returns.columns:
-                    mean_ret = returns[etf].iloc[-252:].mean()
-                    if not np.isnan(mean_ret):
-                        best_per_etf[etf] = (mean_ret, 0)
+        if not all_preds or max(all_preds) <= 0:
+            print("  All factor predictions zero or negative – using historical mean returns (last 252 days) as scores.")
+            best_per_etf = {etf: (hist_means.get(etf, 0.0), 0) for etf in tickers if etf in returns.columns}
+        else:
+            # Also ensure no ETF has a zero prediction – set to historical mean if zero
+            for etf, (pred, win) in list(best_per_etf.items()):
+                if pred <= 0:
+                    best_per_etf[etf] = (hist_means.get(etf, 0.0), 0)
 
         if not best_per_etf:
             print("  No valid predictions")
